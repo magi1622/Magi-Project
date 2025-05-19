@@ -1,0 +1,422 @@
+import os, re, html, csv
+import numpy as np
+import pandas as pd
+
+data_dir = 'Subtask_A/'
+downloaded_dir = os.path.join(data_dir, 'downloaded/') # Define the downloaded directory path
+
+# Create the downloaded directory if it doesn't exist
+if not os.path.exists(downloaded_dir):
+    print(f"Creating directory: {downloaded_dir}")
+    os.makedirs(downloaded_dir)
+    print(f"Please place the training files in the directory: {downloaded_dir}")
+    # You might want to exit the script here if the files are mandatory to proceed
+    # import sys
+    # sys.exit()
+
+
+train_files = [
+    'twitter-2013train-A.tsv',
+    'twitter-2013dev-A.tsv',
+    'twitter-2013test-A.tsv',
+    'twitter-2014sarcasm-A.tsv',
+    'twitter-2014test-A.tsv',
+    'twitter-2015train-A.tsv',
+    'twitter-2015test-A.tsv',
+    'twitter-2016train-A.tsv',
+    'twitter-2016dev-A.tsv',
+    'twitter-2016devtest-A.tsv',
+    'twitter-2016test-A.tsv',
+]
+
+def load_dataframe(file_path):
+    return pd.read_csv(
+        file_path,
+        sep='\t',
+        quoting=csv.QUOTE_NONE,
+        usecols=[0,1,2],
+        names=['id', 'label', 'message'],
+        index_col=0,
+        dtype={'label': 'category'})
+
+train_dfs = []
+for f in train_files:
+    # Use the defined downloaded_dir
+    file_path = os.path.join(downloaded_dir, f)
+    # Add a check if the file exists before trying to load
+    if not os.path.exists(file_path):
+        print(f"Error: File not found - {file_path}")
+        # You might want to skip this file or raise an error
+        continue # Skip to the next file
+        # raise FileNotFoundError(f"File not found: {file_path}")
+
+    train_dfs.append(load_dataframe(file_path))
+
+# Check if any dataframes were loaded before concatenating
+if not train_dfs:
+    print("No training dataframes were loaded. Please check if the files exist.")
+else:
+    tweets_train = pd.concat(train_dfs)
+    tweets_train.drop_duplicates(inplace=True)
+    tweets_train = tweets_train.sample(frac=1.0, random_state=42)
+
+    # Clean and prepare messages:
+    def preprocess_messages(messages):
+        messages = messages.str.decode('unicode_escape', errors='ignore')
+        messages = messages.apply(html.unescape)
+        messages = messages.str.strip('"')  # remove left-most and right-most "
+        messages = messages.str.replace('""', '"', regex=False)
+        return messages
+    tweets_train['message'] = preprocess_messages(tweets_train['message'])
+
+    tweets_train_y = tweets_train['label'].cat.codes
+    labels = tweets_train.label.cat.categories.tolist()
+    labels_codes = {}
+    for i, label in enumerate(labels):
+        labels_codes[label] = i
+
+    print('Total number of examples for training: {}\nDistribution of classes:\n{}'.format(
+        len(tweets_train),
+        tweets_train['label'].value_counts() / len(tweets_train),
+    ))
+
+    display(tweets_train.head()) # Using display for output in notebook
+
+    from sklearn import metrics
+    from sklearn.model_selection import cross_validate
+
+    f1_pos_neg = metrics.make_scorer(
+        metrics.f1_score,
+        average='macro',
+        labels=[labels_codes['negative'], labels_codes['positive']])
+    recall_neg = metrics.make_scorer(
+        metrics.recall_score,
+        average='micro',
+        labels=[labels_codes['negative']])
+
+    def evaluate_model(model, features, labels, cv=3, fit_params=None):
+        scores = cross_validate(
+            model,
+            features,
+            labels,
+            cv=cv,
+            fit_params=fit_params,
+            scoring={
+                'recall_macro': 'recall_macro',
+                'f1_pos_neg': f1_pos_neg,
+                'accuracy': 'accuracy',
+                'recall_neg': recall_neg,
+            },
+            n_jobs=-1,
+        )
+
+        results = pd.DataFrame(scores).drop(['fit_time', 'score_time'], axis=1)
+        results.columns = pd.MultiIndex.from_tuples([c.split('_', maxsplit=1) for c in results.columns])
+        summary = results.describe()
+        # Use concat instead of append which is deprecated
+        results = pd.concat([results, summary.loc[['mean', 'std']]])
+
+        def custom_style(row):
+            color = 'white'
+            if row.name == 'mean':
+                color = 'yellow'
+            return ['background-color: %s' % color]*len(row.values)
+        results = results[sorted(results.columns, key=lambda x: x[0], reverse=True)]
+        results = results.style.apply(custom_style, axis=1)
+
+        return results
+
+    from sklearn.base import BaseEstimator
+    from textblob import TextBlob
+
+    class TextBlobClassifier(BaseEstimator):
+        def __init__(self, threshold=0.1):
+            self.threshold = threshold
+
+        def fit(self, X, y):
+            return self  # nothing to do
+
+        def predict(self, X):
+            labels = []
+            for m in X:
+                blob = TextBlob(m)
+                polarity = blob.sentiment.polarity
+                if polarity > self.threshold:
+                    labels.append(labels_codes['positive'])
+                elif polarity < -self.threshold:
+                    labels.append(labels_codes['negative'])
+                else:
+                    labels.append(labels_codes['neutral'])
+            return labels
+
+    display(evaluate_model(TextBlobClassifier(), tweets_train['message'], tweets_train_y)) # Using display for output
+
+    import spacy
+    from sklearn.base import TransformerMixin
+
+    class TweetTokenizer(BaseEstimator, TransformerMixin):
+        # I rewrote most preprocessing rules according to the original GloVe's tokenizer (in Ruby):
+        # https://nlp.stanford.edu/projects/glove/preprocess-twitter.rb
+
+        eyes_regex = r'[8:=;]'
+        nose_regex = r"['`\-]?"
+
+        def __init__(self):
+            self.nlp = spacy.load('en_core_web_sm', disable = ['ner', 'tagger', 'parser', 'textcat'])
+            for token in ['<url>', '<user>', '<smile>', '<lolface>', '<sadface>', '<neutralface>', '<heart>', '<number>', '<repeat>', '<elong>', '<hashtag>']:
+                self.nlp.tokenizer.add_special_case(token, [{spacy.symbols.ORTH: token}])
+
+        def fit(self, X, y=None):
+            return self
+
+        def transform(self, messages):
+            messages =  messages.str.replace(r'https?://\S+\b|www\.(\w+\.)+\S*', '<URL>', regex=True) # Added regex=True for clarity
+
+            # Force splitting words appended with slashes/parenthesis/brackets (once we tokenized the URLs, of course)
+            messages = messages.str.replace(r'([/()\[\]])',r' \1 ', regex=True) # Added regex=True
+
+            messages =  messages.str.replace(r'@\w+', '<USER>', regex=True) # Added regex=True
+            messages =  messages.str.replace(r'[-+]?[.\d]*[\d]+[:,.\d]*', ' <NUMBER> ', regex=True) # Added regex=True
+
+            def replace_hash_text(match):
+                hash_text = match.group(1)
+                if hash_text.isupper():
+                    return '<HASHTAG> ' + hash_text
+                else:
+                    return '<HASHTAG> ' + ' '.join(re.findall(r'([a-zA-Z0-9]+?)(?=\b|[A-Z0-9_])', hash_text))
+
+            messages =  messages.str.replace(r'#(\S+)', replace_hash_text, regex=True) # Added regex=True
+            messages =  messages.str.replace(self.eyes_regex + self.nose_regex + r'[)d]+|[)d]+' + self.nose_regex + self.eyes_regex, '<SMILE>', flags=re.IGNORECASE, regex=True) # Added regex=True
+            messages =  messages.str.replace(self.eyes_regex + self.nose_regex + r'p+', '<LOLFACE>', flags=re.IGNORECASE, regex=True) # Added regex=True
+            messages =  messages.str.replace(self.eyes_regex + self.nose_regex + r'\(+|\)+' + self.nose_regex + self.eyes_regex, '<SADFACE>', regex=True) # Added regex=True
+            messages =  messages.str.replace(self.eyes_regex + self.nose_regex + r'[/|l*]', '<NEUTRALFACE>', regex=True) # Added regex=True
+            messages =  messages.str.replace(r'<3', '<HEART>', regex=True) # Added regex=True
+
+            # Mark punctuation repetitions (eg. "!!!" => "! <REPEAT>")
+            messages =  messages.str.replace(r'([!?.]){2,}', r'\1 <REPEAT>', regex=True) # Added regex=True
+
+            # Mark elongated words (eg. "wayyyy" => "way <ELONG>")
+            messages =  messages.str.replace(r'\b(\S*?)(.)\2{2,}\b', r'\1\2 <ELONG>', regex=True) # Added regex=True
+
+            # Replace all whitespace characters by only one space
+            messages =  messages.str.replace(r'\s+', ' ', regex=True) # Added regex=True
+            messages = messages.str.strip()
+            messages =  messages.str.lower()
+
+            return messages.apply(lambda msg: [token.text for token in self.nlp(msg)])
+
+    # let's see some examples:
+    tweets_train_tokenized = TweetTokenizer().fit_transform(tweets_train['message'])
+    print("First 5 tokenized tweets:") # Added print for clarity
+    print(tweets_train_tokenized[:5])
+
+    from collections import Counter
+
+    print("Counter for the first tokenized tweet:") # Added print for clarity
+    print(Counter(tweets_train_tokenized.iloc[0]))
+
+    from sklearn.feature_extraction import DictVectorizer
+    from sklearn.feature_extraction.text import TfidfTransformer
+
+    class BagOfWords(BaseEstimator, TransformerMixin):
+        def __init__(self, min_frequency=2, clip_counts=False, use_tfidf=False):
+            self.min_frequency = min_frequency # to reduce our total vocabulary size, we only keep words that appear at least n times
+            self.clip_counts = clip_counts # clip the counts to a maximum of 1 (is the word present or not)
+            self.use_tfidf = use_tfidf
+
+        def fit(self, X, y=None):
+            self.keep_columns = None
+            self.vectorizer = DictVectorizer(dtype=np.int64) # Changed dtype to np.int64 to avoid future warnings
+
+            self.tfidf_transformer = None
+            if self.use_tfidf:
+                self.tfidf_transformer = TfidfTransformer()
+
+            if self.clip_counts:
+                bags_of_words = X.apply(lambda tokens: Counter(set(tokens)))
+            else:
+                bags_of_words = X.apply(lambda tokens: Counter(tokens))
+
+            X_vectors = self.vectorizer.fit_transform(bags_of_words)
+            self.keep_columns = np.array(X_vectors.sum(axis=0) >= self.min_frequency).squeeze()
+
+            if self.use_tfidf:
+                self.tfidf_transformer.fit(X_vectors[:, self.keep_columns])
+
+            return self
+
+        def transform(self, X):
+            if self.clip_counts:
+                bags_of_words = X.apply(lambda tokens: Counter(set(tokens)))
+            else:
+                bags_of_words = X.apply(lambda tokens: Counter(tokens))
+
+            X_vectors = self.vectorizer.transform(bags_of_words)
+            X_vectors = X_vectors[:, self.keep_columns]
+            if self.use_tfidf:
+                X_vectors = self.tfidf_transformer.transform(X_vectors)
+
+            return X_vectors
+
+
+    print("Examples of bags of words without normalization (raw counts per document):")
+    print(BagOfWords(min_frequency=2, use_tfidf=False).fit_transform(tweets_train_tokenized[:5]).toarray(), end='\n\n\n')
+
+    print("The same examples as above but with counts clipped to 1:")
+    print(BagOfWords(min_frequency=2, clip_counts=True).fit_transform(tweets_train_tokenized[:5]).toarray(), end='\n\n\n')
+
+    print("The same examples as above but with TF-IDF normalization:")
+    print(np.around(BagOfWords(min_frequency=2, use_tfidf=True).fit_transform(tweets_train_tokenized[:5]).toarray(), decimals=1))
+
+    import torch
+    import transformers
+    import tqdm
+
+    class BertEmbeddings(TransformerMixin):
+        def __init__(self, max_sequence_length=50, batch_size=32, device='cpu'):
+            self.max_sequence_length = max_sequence_length
+            self.batch_size = batch_size
+            self.device = torch.device(device)
+            self.tokenizer = transformers.BertTokenizer.from_pretrained('bert-base-cased')
+            self.model = transformers.BertModel.from_pretrained('bert-base-cased', output_hidden_states=True)
+            self.model.eval()
+            self.model.to(self.device)
+
+        def transform(self, messages):
+            embeddings = np.zeros((len(messages),768), dtype=np.float32)
+            with torch.no_grad():
+                # Ensure messages are a list of strings
+                message_list = messages.tolist() if isinstance(messages, pd.Series) else list(messages)
+
+                for i in tqdm.tqdm(range(0, len(message_list), self.batch_size)):
+                    batch_messages = message_list[i:i+self.batch_size]
+                    encoded = self.tokenizer.batch_encode_plus(
+                        batch_messages, # Use the list of strings
+                        max_length=self.max_sequence_length,
+                        padding='max_length', # Use padding instead of pad_to_max_length (deprecated)
+                        truncation=True,
+                        return_tensors='pt' # Return PyTorch tensors
+                    )
+                    # Move tensors to the specified device
+                    input_ids = encoded['input_ids'].to(self.device)
+                    attention_mask = encoded['attention_mask'].to(self.device)
+                    token_type_ids = encoded['token_type_ids'].to(self.device)
+
+                    output = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids)
+
+                    # the indice `2` of the output contains a tuple of hidden states for all layers + final embeddings output
+                    # The last hidden state is typically output[0] or output.last_hidden_state in newer versions
+                    # Based on the original code's indexing output[2][-2], it seems to be accessing hidden states.
+                    # Let's stick to the original logic but be aware of potential version differences.
+                    # output[2] contains (embeddings, layer_1_hidden_state, ..., layer_n_hidden_state)
+                    # [-2] would be the second to last layer's hidden state
+                    full_embeddings = output[2][-2].cpu().numpy()
+
+                    for j in range(len(batch_messages)):
+                        # Find the actual length of the sentence before padding
+                        sentence_length = (encoded['attention_mask'][j] > 0).sum().item()
+                        words_embeddings = full_embeddings[j,:sentence_length]
+                        # We multiply the avg. embedding by the square root of the number of words
+                        # to compensate for the fact that the mean of n vectors gets shorter as n grows
+                        if sentence_length > 0: # Avoid division by zero if sentence_length is 0 (empty string)
+                            embeddings[i+j] = np.mean(words_embeddings, axis=0) * np.sqrt(len(words_embeddings))
+                        else:
+                            embeddings[i+j] = np.zeros(768) # Or handle empty strings appropriately
+
+            return embeddings
+
+    tweets_train_bert = BertEmbeddings(device='cuda').transform(tweets_train['message'].to_numpy())
+    print('Finished encoding the messages! The final shape of our array is {}'.format(tweets_train_bert.shape))
+
+    from sklearn.naive_bayes import MultinomialNB
+
+    # we set fit_prior=False to use a uniform distribution as the prior (better for imbalanced classification)
+    display(evaluate_model( # Using display for output
+        MultinomialNB(fit_prior=False),
+        BagOfWords(min_frequency=2, clip_counts=True).fit_transform(tweets_train_tokenized),
+        tweets_train_y))
+
+    from sklearn.linear_model import LogisticRegression
+
+    log_reg = LogisticRegression(multi_class='multinomial', solver='lbfgs', class_weight='balanced')
+
+    display(evaluate_model( # Using display for output
+        log_reg,
+        BagOfWords().fit_transform(tweets_train_tokenized),
+        tweets_train_y))
+
+    display(evaluate_model( # Using display for output
+        log_reg,
+        BagOfWords(use_tfidf=True).fit_transform(tweets_train_tokenized),
+        tweets_train_y))
+
+    display(evaluate_model( # Using display for output
+        log_reg,
+        tweets_train_bert,
+        tweets_train_y))
+
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    def grid_search_report(model, params, X, y, cv=3):
+
+        grid_search = GridSearchCV(model, params, cv=cv, scoring='recall_macro', return_train_score=True, verbose=1, refit=False, n_jobs=-1)
+        grid_search.fit(X, y)
+
+        results = pd.DataFrame(grid_search.cv_results_)
+        # Flatten the list of parameter names if it's a list of dicts
+        param_names = [p for param_set in params for p in param_set.keys()]
+        keep_cols = ['param_' + p for p in param_names]
+        keep_cols += ['mean_train_score', 'mean_test_score', 'std_test_score']
+        results = pd.DataFrame(grid_search.cv_results_).sort_values(by='mean_test_score', ascending=False).reset_index()
+        results = results[keep_cols]
+
+        def custom_style(row):
+            color = 'white'
+            if row.name == 0:
+                color = 'yellow'
+            return ['background-color: %s' % color]*len(row.values)
+        results = results.head(10).style.apply(custom_style, axis=1)
+
+        return results
+
+    display(grid_search_report( # Using display for output
+        model=Pipeline([
+            ('standardization', StandardScaler()),
+            ('cls', LogisticRegression(multi_class='multinomial', solver='lbfgs', class_weight='balanced'))
+        ]),
+        params=[{
+            'cls__C': [1.0, 0.1, 0.01, 0.001, 0.0001], # Removed None as it's not a valid C value
+        }],
+        X=tweets_train_bert,
+        y=tweets_train['label'].cat.codes,
+    ))
+
+    final_model = Pipeline([
+        ('standardization', StandardScaler()),
+        ('cls', LogisticRegression(multi_class='multinomial', solver='lbfgs', class_weight='balanced', C=0.001, max_iter=1000))
+    ])
+
+    final_model.fit(tweets_train_bert, tweets_train_y)
+
+    # Load test data - added checks similar to training data
+    test_file_path = 'Subtask_A/gold/SemEval2017-task4-test.subtask-A.english.txt'
+    if not os.path.exists(test_file_path):
+        print(f"Error: Test file not found - {test_file_path}")
+    else:
+        tweets_test = load_dataframe(test_file_path)
+        tweets_test['message'] = preprocess_messages(tweets_test['message'])
+        tweets_test_bert = BertEmbeddings(device='cuda').transform(tweets_test['message'].to_numpy())
+        tweets_test_y = tweets_test['label'].map(lambda label: labels_codes[label])
+
+        print('\nTotal number of examples for testing: {}\nDistribution of classes:\n{}'.format(
+            len(tweets_test),
+            tweets_test['label'].value_counts() / len(tweets_test),
+        ))
+
+        tweets_test_predictions = final_model.predict(tweets_test_bert)
+        print(metrics.classification_report(tweets_test_y, tweets_test_predictions, target_names=labels))
